@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Araç Bakım Takip - tamamen çevrimdışı çalışan masaüstü programı.
 Çalıştırınca tarayıcıda açılır. Veriler yanındaki bakim_verileri.db dosyasında durur."""
+from urllib.parse import quote
 import os, re, sys, io, json, time, base64, socket, sqlite3, threading, webbrowser, urllib.request, urllib.error, datetime as dt
 from flask import Flask, request, redirect, render_template, send_file, abort
 from jinja2 import DictLoader
@@ -31,18 +32,54 @@ DEFAULT_BAKIM = [("Motor yağı ve filtresi", "Rutin", 10000, 12), ("Hava filtre
                  ("Triger seti, devirdaim, V-kayışı ve rulmanlar", "Ağır", 80000, 48), ("Şanzıman yağı", "Ağır", 100000, 60),
                  ("Soğutma sıvısı (antifriz)", "Ağır", None, 36), ("Fren hidroliği", "Ağır", None, 24)]
 
-KINDS = ["Motor yağı seviyesi", "Soğutma sıvısı seviyesi", "Turbo akustik", "Egzoz emisyon", "Yakıt tüketimi", "Lastik basıncı"]
-PERIOD = {"Motor yağı seviyesi": 15, "Soğutma sıvısı seviyesi": 15, "Turbo akustik": 7,
-          "Egzoz emisyon": 15, "Yakıt tüketimi": 15, "Lastik basıncı": 15}
+K_YAG, K_SOG, K_TUR, K_EGZ, K_YAK, K_LAS = "Motor yağı seviyesi", "Soğutma sıvısı seviyesi", "Turbo akustik", "Egzoz emisyon", "Yakıt tüketimi", "Lastik basıncı"
+KINDS = [K_YAG, K_SOG, K_TUR, K_YAK, K_LAS]
+PERIOD = {K_YAG: 15, K_SOG: 15, K_TUR: 7, K_YAK: 15, K_LAS: 15}
 CATS = ["Bakım", "Yedek parça", "İşçilik", "Yakıt", "Sigorta", "Muayene", "Vergi", "Lastik", "Diğer"]
+EV_MUAYENE, EV_EGZOZ, EV_KASKO, EV_ZMSS = "Araç muayene", "Egzoz emisyon", "Kasko", "Zorunlu trafik sigortası (ZMSS)"
+EVRAK_KINDS = [EV_MUAYENE, EV_EGZOZ, EV_KASKO, EV_ZMSS]
+
+def F(n, l, t, u=None, **kw):
+    return dict(n=n, l=l, t=t, u=u, **kw)   # t: date text pct dec int sel
+
+_LVL = [F("date", "Tarih", "date", req=1), F("seviye", "Durum (seviye)", "pct", "%", req=1),
+        F("ekleme", "Ekleme", "sel", opts=["Yapılmadı", "Yapıldı"], req=1), F("miktar", "Miktar", "dec", "ml", dep="ekleme=Yapıldı"), F("note", "Not", "text")]
+_BK = lambda: [F("last_date", "Tarih", "date", req=1), F("last_km", "KM", "int", "km"), F("interval_km", "Periyot (km)", "int", "km"),
+               F("interval_ay", "Periyot (ay)", "int", "ay"), F("note", "Not", "text")]
+_EV = [F("date", "Tarih", "date"), F("expiry", "Bitiş tarihi", "date", req=1), F("note", "Not", "text")]
+# bakım kalemleri: (slug, ad, grup, periyot km, periyot ay)
+BAKIM_ITEMS = [("motor-yagi", "Motor yağı", "Rutin", 10000, 12), ("yag-filtresi", "Yağ filtresi", "Rutin", 10000, 12),
+               ("polen-filtresi", "Polen filtresi", "Rutin", 10000, 12), ("hava-filtresi", "Hava filtresi", "Rutin", 10000, 12),
+               ("mazot-filtresi", "Mazot filtresi", "Rutin", 20000, None), ("triger", "Triger seti", "Ağır", 80000, None),
+               ("sanziman", "Şanzıman yağı", "Ağır", 100000, None), ("sogutma-sivisi", "Soğutma sıvısı", "Ağır", None, None),
+               ("fren", "Fren hidroliği", "Ağır", None, None)]
+TABS = {
+    "kontrol": dict(title="Kondisyon Kontrolleri", col="kind", tabs=[
+        dict(s="yag", l="Motor yağı", v=K_YAG, f=_LVL), dict(s="sogutma", l="Soğutma sıvısı", v=K_SOG, f=_LVL),
+        dict(s="turbo", l="Turbo akustik", v=K_TUR, f=[F("date", "Tarih", "date", req=1), F("result", "Durum / sonuç", "text", req=1), F("note", "Not", "text")]),
+        dict(s="yakit", l="Yakıt tüketimi", v=K_YAK, any=["ort", "litre", "tuk_km"], f=[F("date", "Tarih", "date", req=1), F("ort", "Ortalama tüketim", "dec", "L/100km"),
+             F("litre", "Tüketilen yakıt", "dec", "L"), F("tuk_km", "Kilometre", "dec", "km"), F("note", "Not", "text")]),
+        dict(s="lastik", l="Lastik basıncı", v=K_LAS, any=["p_sag_on", "p_sol_on", "p_sag_arka", "p_sol_arka", "p_stepne"], f=[F("date", "Tarih", "date", req=1),
+             F("p_sag_on", "Sağ ön", "dec", "psi"), F("p_sol_on", "Sol ön", "dec", "psi"), F("p_sag_arka", "Sağ arka", "dec", "psi"),
+             F("p_sol_arka", "Sol arka", "dec", "psi"), F("p_stepne", "Stepne", "dec", "psi"), F("note", "Not", "text")])]),
+    "bakim": dict(title="Periyodik ve Ağır Bakım", col="name", tabs=[
+        dict(s=sl, l=ad, v=ad, grup=gr, c="g-yesil" if gr == "Rutin" else "g-mavi", ik=ik, ia=ia, f=_BK()) for sl, ad, gr, ik, ia in BAKIM_ITEMS]),
+    "evrak": dict(title="Evrak ve Muayene", col="kind", tabs=[
+        dict(s="muayene", l="Araç muayene", v=EV_MUAYENE, f=_EV), dict(s="egzoz", l="Egzoz emisyon", v=EV_EGZOZ, f=_EV),
+        dict(s="kasko", l="Kasko", v=EV_KASKO, f=_EV), dict(s="zmss", l="Trafik sigortası (ZMSS)", v=EV_ZMSS, f=_EV)]),
+}
+TAB_OF = {(n, t["v"]): t["s"] for n, c in TABS.items() for t in c["tabs"]}
 
 # (alan, etiket, tür, seçenekler)  tür: text, area, date, int, num, select
 TABLES = {
     "km": dict(title="KM Takibi", order="date DESC, id DESC", cols=[
         ("date", "Tarih", "date", None), ("km", "Güncel KM", "int", None), ("note", "Not", "text", None)]),
     "kontrol": dict(title="Kondisyon Kontrolleri", order="date DESC, id DESC", cols=[
-        ("date", "Tarih", "date", None), ("kind", "Kontrol", "select", KINDS),
-        ("result", "Durum / Sonuç", "text", None), ("note", "Not", "area", None)]),
+        ("date", "Tarih", "date", None), ("kind", "Kontrol", "text", None), ("seviye", "Durum (seviye %)", "num", None),
+        ("ekleme", "Ekleme", "text", None), ("miktar", "Miktar (ml)", "num", None), ("ort", "Ort. tüketim (L/100km)", "num", None),
+        ("litre", "Yakıt (L)", "num", None), ("tuk_km", "Kilometre (km)", "num", None), ("p_sag_on", "Sağ ön (psi)", "num", None),
+        ("p_sol_on", "Sol ön (psi)", "num", None), ("p_sag_arka", "Sağ arka (psi)", "num", None), ("p_sol_arka", "Sol arka (psi)", "num", None),
+        ("p_stepne", "Stepne (psi)", "num", None), ("result", "Sonuç", "text", None), ("note", "Not", "text", None)]),
     "bakim": dict(title="Periyodik ve Ağır Bakım", order="grup, name", cols=[
         ("name", "Kalem", "text", None), ("grup", "Grup", "select", ["Rutin", "Ağır"]),
         ("interval_km", "Periyot (km)", "int", None), ("interval_ay", "Periyot (ay)", "int", None),
@@ -55,9 +92,8 @@ TABLES = {
     "harcama": dict(title="Harcamalar", order="date DESC, id DESC", cols=[
         ("date", "Tarih", "date", None), ("category", "Kategori", "select", CATS),
         ("descr", "Açıklama", "text", None), ("amount", "Tutar (₺)", "num", None), ("km", "KM", "int", None)]),
-    "evrak": dict(title="Evrak ve Muayene", order="expiry", cols=[
-        ("kind", "Evrak", "select", ["Muayene (TÜVTÜRK)", "Zorunlu Trafik Sigortası", "Kasko", "Diğer"]),
-        ("expiry", "Bitiş tarihi", "date", None), ("note", "Not", "text", None)]),
+    "evrak": dict(title="Evrak ve Muayene", order="kind, expiry DESC", cols=[
+        ("kind", "Evrak", "text", None), ("date", "Tarih", "date", None), ("expiry", "Bitiş tarihi", "date", None), ("note", "Not", "text", None)]),
     "arac": dict(title="Araçlar", order="name", cols=[
         ("name", "Araç adı / model", "text", None), ("plate", "Plaka", "text", None), ("year", "Model yılı", "int", None),
         ("status", "Durum", "select", ["Aktif", "Satıldı"]), ("note", "Not", "area", None)]),
@@ -120,13 +156,81 @@ def get_db():
     return db
 
 def seed_arac(db, aid, bakim=True):
-    """Yeni araç için evrak satırlarını (ve istenirse standart bakım kalemlerini) ekler."""
-    if not db.execute("SELECT 1 FROM evrak WHERE arac_id=?", (aid,)).fetchone():
-        for k in ("Muayene (TÜVTÜRK)", "Zorunlu Trafik Sigortası", "Kasko"):
-            db.execute("INSERT INTO evrak(arac_id, kind, expiry, note) VALUES(?,?,?,?)", (aid, k, None, "Bitiş tarihini girin"))
-    if bakim and not db.execute("SELECT 1 FROM bakim WHERE arac_id=?", (aid,)).fetchone():
-        for n, g, ikm, iay in DEFAULT_BAKIM:
-            db.execute("INSERT INTO bakim(arac_id, name, grup, interval_km, interval_ay) VALUES(?,?,?,?,?)", (aid, n, g, ikm, iay))
+    """Yeni araç boş başlar: kayıtlar sekmelerden girilir."""
+    return
+
+def dhash(s):
+    """Cihazlar arasında aynı sonucu veren (JS ile birebir) kimlik türetme."""
+    out = ""
+    for i in range(4):
+        h = (0x811C9DC5 ^ ((i * 0x9E3779B1) & 0xFFFFFFFF)) & 0xFFFFFFFF
+        for b in s.encode("utf-8"):
+            h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+        out += "%08x" % h
+    return out
+
+def _num(x):
+    try:
+        return float(str(x).replace(",", "."))
+    except ValueError:
+        return None
+
+BAKIM_RENAME = {"Motor yağı ve filtresi": "Motor yağı", "Mazot / yakıt filtresi": "Mazot filtresi",
+                "Triger seti, devirdaim, V-kayışı ve rulmanlar": "Triger seti", "Soğutma sıvısı (antifriz)": "Soğutma sıvısı"}
+EVRAK_RENAME = {"Muayene (TÜVTÜRK)": EV_MUAYENE, "Zorunlu Trafik Sigortası": EV_ZMSS}
+
+def migrate_data(db):
+    """Eski biçimdeki kayıtları yeni yapıya aktarır (tekrar çalıştırılabilir)."""
+    for r in db.execute("SELECT * FROM kontrol WHERE result IS NOT NULL AND result<>'' AND kind IN (?,?,?,?)", (K_YAG, K_SOG, K_YAK, K_LAS)).fetchall():
+        res, note, up = r["result"], r["note"] or "", {}
+        if r["kind"] in (K_YAG, K_SOG):
+            m = re.search(r"Seviye\s*%?\s*([\d.,]+)", res)
+            if not m:
+                continue
+            up["seviye"] = _num(m.group(1))
+            m2 = re.search(r"ekleme:\s*(\S+)", res)
+            low = m2.group(1).lower() if m2 else ""
+            up["ekleme"] = "Yapılmadı" if low.startswith("yapılma") else "Yapıldı" if low.startswith("yapıl") else None
+            m3 = re.match(r"Eklenen:\s*([\d.,]+)\s*ml\s*$", note, re.I)
+            if m3:
+                up["miktar"], note = _num(m3.group(1)), ""
+        elif r["kind"] == K_YAK:
+            m = re.search(r"([\d.,]+)\s*L/100", res)
+            if not m:
+                continue
+            up["ort"] = _num(m.group(1))
+            m3 = re.match(r"([\d.,]+)\s*L\s*/\s*([\d.,]+)\s*km", note)
+            if m3:
+                up["litre"], up["tuk_km"], note = _num(m3.group(1)), _num(m3.group(2)), ""
+        else:
+            vals = {}
+            for col, pat in (("p_sag_on", "sağ ön"), ("p_sol_on", "sol ön"), ("p_sag_arka", "sağ arka"), ("p_sol_arka", "sol arka"), ("p_stepne", "stepne")):
+                m = re.search(pat + r"\s*([\d.,]+|-)", res, re.I)
+                vals[col] = _num(m.group(1)) if m and m.group(1) != "-" else None
+            if "psi" not in res and not any(v is not None for v in vals.values()):
+                continue
+            up.update(vals)
+        up["result"], up["note"] = None, note
+        db.execute(f"UPDATE kontrol SET {','.join(k + '=?' for k in up)} WHERE id=?", list(up.values()) + [r["id"]])
+    for r in db.execute("SELECT * FROM kontrol WHERE kind=?", (K_EGZ,)).fetchall():          # egzoz emisyon -> evrak
+        uid = dhash((r["uid"] or "") + ":egzoz")
+        if r["uid"] and not db.execute("SELECT 1 FROM evrak WHERE uid=?", (uid,)).fetchone():
+            note = "Gözlem: " + (r["result"] or "-") + (" · " + r["note"] if r["note"] else "")
+            db.execute("INSERT INTO evrak(uid, upd, arac_id, kind, date, note) VALUES(?,?,?,?,?,?)", (uid, r["upd"], r["arac_id"], EV_EGZOZ, r["date"], note))
+        db.execute("DELETE FROM kontrol WHERE id=?", (r["id"],))
+    for old, new in EVRAK_RENAME.items():
+        db.execute("UPDATE evrak SET kind=? WHERE kind=?", (new, old))
+    db.execute("DELETE FROM evrak WHERE (expiry IS NULL OR expiry='') AND (date IS NULL OR date='') AND note='Bitiş tarihini girin'")
+    for r in db.execute("SELECT * FROM bakim WHERE name='Motor yağı ve filtresi'").fetchall():   # yağ + yağ filtresi ayrı kalem
+        uid = dhash((r["uid"] or "") + ":yagfiltresi")
+        if r["uid"] and (r["last_km"] is not None or r["last_date"]) and not db.execute("SELECT 1 FROM bakim WHERE uid=?", (uid,)).fetchone():
+            db.execute("INSERT INTO bakim(uid, upd, arac_id, name, grup, interval_km, interval_ay, last_date, last_km) VALUES(?,?,?,?,?,?,?,?,?)",
+                       (uid, r["upd"], r["arac_id"], "Yağ filtresi", "Rutin", r["interval_km"], r["interval_ay"], r["last_date"], r["last_km"]))
+    for old, new in BAKIM_RENAME.items():
+        db.execute("UPDATE bakim SET name=? WHERE name=?", (new, old))
+    db.execute("DELETE FROM bakim WHERE (last_date IS NULL OR last_date='') AND last_km IS NULL")
+    for sl, ad, gr, ik, ia in BAKIM_ITEMS:
+        db.execute("UPDATE bakim SET grup=? WHERE name=? AND grup IS NOT ?", (gr, ad, gr))
 
 def migrate(db):
     db.executescript(SCHEMA)
@@ -139,6 +243,13 @@ def migrate(db):
     for t in SCOPED:
         if "arac_id" not in cols(t):
             db.execute(f"ALTER TABLE {t} ADD COLUMN arac_id INTEGER")
+    for c in ("seviye", "miktar", "ort", "litre", "tuk_km", "p_sag_on", "p_sol_on", "p_sag_arka", "p_sol_arka", "p_stepne"):
+        if c not in cols("kontrol"):
+            db.execute(f"ALTER TABLE kontrol ADD COLUMN {c} REAL")
+    if "ekleme" not in cols("kontrol"):
+        db.execute("ALTER TABLE kontrol ADD COLUMN ekleme TEXT")
+    if "date" not in cols("evrak"):
+        db.execute("ALTER TABLE evrak ADD COLUMN date TEXT")
     if not db.execute("SELECT 1 FROM arac").fetchone():
         db.execute("INSERT INTO arac(name, status) VALUES('Aracım', 'Aktif')")
     first = db.execute("SELECT id FROM arac ORDER BY id").fetchone()[0]
@@ -153,6 +264,7 @@ def migrate(db):
           UPDATE {t} SET upd={NOW_SQL} WHERE id=NEW.id; END;
         CREATE TRIGGER IF NOT EXISTS {t}_ad AFTER DELETE ON {t} BEGIN
           INSERT INTO silinen(uid, tbl, upd) VALUES(OLD.uid, '{t}', {NOW_SQL}); END;""")
+    migrate_data(db)
     for t in SYNC_TABLES:   # tetikleyicilerden önce eklenen satırlar (varsayılan araç, ilk bakım/evrak kalemleri) için kimlik ver
         db.execute(f"UPDATE {t} SET uid=lower(hex(randomblob(16))), upd={NOW_SQL} WHERE uid IS NULL")
 
@@ -214,32 +326,42 @@ def bakim_status(it, cur_km, perday):
                 worse("warn")
             parts.append(f"{days} gün kaldı ({nd.strftime('%d.%m.%Y')})")
     if not known:
+        if (it["last_km"] is not None or it["last_date"]) and not (it["interval_km"] or it["interval_ay"]):
+            return "ok", f"Son işlem: {fdate(it['last_date']) or '-'} · {fint(it['last_km']) or '-'} km (periyot tanımlı değil)"
         return "unk", "Son işlem bilinmiyor, tarih ve km girin"
     return level, "; ".join(parts)
+
+def bakim_latest(rows):
+    return max(rows, key=lambda r: (r["last_km"] if r["last_km"] is not None else -1, r["last_date"] or ""), default=None)
 
 def build_alerts(db, aid):
     cur_km, perday = km_stats(db, aid)
     out, today = [], dt.date.today()
-    for it in db.execute("SELECT * FROM bakim WHERE arac_id=? ORDER BY grup, name", (aid,)):
-        lv, det = bakim_status(it, cur_km, perday)
-        out.append(dict(group="Bakım", title=it["name"], detail=det, level=lv, link="/t/bakim"))
+    allb = db.execute("SELECT * FROM bakim WHERE arac_id=?", (aid,)).fetchall()
+    known = [x[1] for x in BAKIM_ITEMS]
+    for nm in known + sorted({r["name"] for r in allb if r["name"] not in known}):
+        ev = bakim_latest([r for r in allb if r["name"] == nm])
+        lv, det = bakim_status(ev, cur_km, perday) if ev else ("unk", "Kayıt yok, ilk kaydı ekleyin")
+        out.append(dict(group="Bakım", title=nm, detail=det, level=lv, link="/s/bakim/" + TAB_OF.get(("bakim", nm), "")))
     for k in KINDS:
         r = db.execute("SELECT MAX(date) d FROM kontrol WHERE kind=? AND arac_id=?", (k, aid)).fetchone()
         if not r["d"]:
-            out.append(dict(group="Kontrol", title=k, detail="Hiç kayıt yok", level="unk", link="/t/kontrol")); continue
+            out.append(dict(group="Kontrol", title=k, detail="Hiç kayıt yok", level="unk", link="/s/kontrol/" + TAB_OF[("kontrol", k)])); continue
         due = pdate(r["d"]) + dt.timedelta(days=PERIOD[k])
         days = (due - today).days
         lv = "bad" if days < 0 else "warn" if days <= 2 else "ok"
         det = f"{-days} gün gecikti (son: {fdate(r['d'])})" if days < 0 else f"{days} gün sonra ({due.strftime('%d.%m.%Y')})"
-        out.append(dict(group="Kontrol", title=k, detail=det, level=lv, link="/t/kontrol"))
-    for e in db.execute("SELECT * FROM evrak WHERE arac_id=? ORDER BY kind", (aid,)):
-        d = pdate(e["expiry"])
-        if not d:
-            out.append(dict(group="Evrak", title=e["kind"], detail="Bitiş tarihi girilmemiş", level="unk", link="/t/evrak")); continue
-        days = (d - today).days
+        out.append(dict(group="Kontrol", title=k, detail=det, level=lv, link="/s/kontrol/" + TAB_OF[("kontrol", k)]))
+    evr = db.execute("SELECT * FROM evrak WHERE arac_id=?", (aid,)).fetchall()
+    for k in EVRAK_KINDS:
+        link = "/s/evrak/" + TAB_OF[("evrak", k)]
+        exps = [r["expiry"] for r in evr if r["kind"] == k and r["expiry"]]
+        if not exps:
+            out.append(dict(group="Evrak", title=k, detail="Kayıt yok, bitiş tarihini girin", level="unk", link=link)); continue
+        d = pdate(max(exps)); days = (d - today).days
         lv = "bad" if days < 0 else "warn" if days <= 30 else "ok"
         det = f"Süresi {-days} gün önce doldu" if days < 0 else f"Bitişe {days} gün ({d.strftime('%d.%m.%Y')})"
-        out.append(dict(group="Evrak", title=e["kind"], detail=det, level=lv, link="/t/evrak"))
+        out.append(dict(group="Evrak", title=k, detail=det, level=lv, link=link))
     out.sort(key=lambda a: LV[a["level"]])
     return out, cur_km, perday
 
@@ -524,6 +646,106 @@ def _sync_loop():
             pass
         time.sleep(10)
 
+
+# ----------------------------------------------------------------- sekmeli sayfalar (kondisyon / bakım / evrak)
+def fnum(v):
+    if v in (None, ""):
+        return ""
+    v = float(v)
+    return fint(v) if v == int(v) else _tr(("%.2f" % v).rstrip("0").rstrip("."))
+
+def tab_show(f, v):
+    if v in (None, ""):
+        return ""
+    t, u = f["t"], f.get("u")
+    if t == "date":
+        return fdate(v)
+    if t == "pct":
+        return "%" + fnum(v)
+    if t == "dec":
+        return fnum(v) + " " + u
+    if t == "int":
+        return fint(v) + " " + u
+    return v
+
+def tab_field(f, val, new):
+    from markupsafe import Markup, escape
+    n, t = f["n"], f["t"]
+    v = "" if val is None else val
+    dep = f' data-dep="{f["dep"]}"' if f.get("dep") else ""
+    req = " required" if f.get("req") else ""
+    if t == "date":
+        if v == "" and new and n in ("date", "last_date"):
+            v = dt.date.today().isoformat()
+        return Markup(f'<input type="date" name="{n}" value="{escape(v)}"{req}>')
+    if t == "sel":
+        o = "".join(f'<option{" selected" if x == v else ""}>{escape(x)}</option>' for x in f["opts"])
+        return Markup(f'<select name="{n}"{dep}{req}>{o}</select>')
+    if t in ("pct", "dec", "int"):
+        shown = "" if v == "" else str(int(round(float(v)))) if t == "int" else ("%.6g" % float(v)).replace(".", ",")
+        unit = "%" if t == "pct" else (f.get("u") or "")
+        return Markup(f'<div class="ibox"><input name="{n}" inputmode="decimal" data-num="{"int" if t == "int" else "dec"}" value="{escape(shown)}"{dep}{req}><span class="u">{escape(unit)}</span></div>')
+    return Markup(f'<input name="{n}" value="{escape(v)}"{req}>')
+
+def parse_tab_form(tab, form):
+    vals, err = {}, []
+    for f in tab["f"]:
+        n, raw, t = f["n"], (form.get(f["n"]) or "").strip(), f["t"]
+        vals[n] = None
+        if f.get("dep"):
+            k, v = f["dep"].split("=", 1)
+            if form.get(k) != v:
+                continue
+            if raw == "":
+                err.append(f"{f['l']} girin"); continue
+        if raw == "":
+            if f.get("req"):
+                err.append(f"{f['l']} boş olamaz")
+            continue
+        if t in ("pct", "dec", "int"):
+            x = parse_num(raw)
+            if x is None or x < 0:
+                err.append(f"{f['l']} sadece rakam olmalı")
+            elif t == "pct" and x > 100:
+                err.append(f"{f['l']} 0-100 arası olmalı")
+            else:
+                vals[n] = int(round(x)) if t == "int" else x
+        elif t == "sel":
+            if raw in f["opts"]:
+                vals[n] = raw
+            else:
+                err.append(f"{f['l']} geçersiz")
+        elif t == "date":
+            if pdate(raw):
+                vals[n] = raw
+            else:
+                err.append(f"{f['l']} geçersiz")
+        else:
+            vals[n] = raw
+    if tab.get("any") and all(vals.get(k) is None for k in tab["any"]):
+        err.append("En az bir değer girin")
+    if "ort" in vals and vals["ort"] is None and vals.get("litre") and vals.get("tuk_km"):
+        vals["ort"] = round(vals["litre"] / vals["tuk_km"] * 100, 1)
+    return vals, err
+
+_TORD = {"kontrol": "date DESC, id DESC", "bakim": "COALESCE(last_km,0) DESC, COALESCE(last_date,'') DESC, id DESC",
+         "evrak": "COALESCE(expiry,'') DESC, COALESCE(date,'') DESC, id DESC"}
+
+def _tabcfg(name, slug):
+    cfg = TABS.get(name)
+    if not cfg:
+        abort(404)
+    tab = next((t for t in cfg["tabs"] if t["s"] == slug), None)
+    if not tab:
+        abort(404)
+    return cfg, tab
+
+def _tab_base(name, tab):
+    d = {TABS[name]["col"]: tab["v"]}
+    if name == "bakim":
+        d["grup"] = tab["grup"]
+    return d
+
 # ----------------------------------------------------------------- Excel'den içe aktarma
 def _d(v):
     if isinstance(v, dt.datetime):
@@ -586,30 +808,30 @@ def import_legacy(db, path, aid):
                 lvl = _n(c(r, 4)); ek = _cap(_t(c(r, 5)))
                 res = (f"Seviye %{round(lvl * 100)}" if lvl is not None else "") + (f", ekleme: {ek}" if ek else "")
                 note = _t(c(r, 6)); db.execute("INSERT INTO kontrol(date,kind,result,note) VALUES(?,?,?,?)",
-                    (_d(c(r, 2)), KINDS[0], res, f"Eklenen: {note}" if note else ""))
+                    (_d(c(r, 2)), K_YAG, res, f"Eklenen: {note}" if note else ""))
             if _d(c(r, 8)):
                 lvl = _n(c(r, 10)); ek = _cap(_t(c(r, 11)))
                 res = (f"Seviye %{round(lvl * 100)}" if lvl is not None else "") + (f", ekleme: {ek}" if ek else "")
                 note = _t(c(r, 12)); db.execute("INSERT INTO kontrol(date,kind,result,note) VALUES(?,?,?,?)",
-                    (_d(c(r, 8)), KINDS[1], res, f"Eklenen: {note}" if note else ""))
+                    (_d(c(r, 8)), K_SOG, res, f"Eklenen: {note}" if note else ""))
             if _d(c(r, 14)):
                 note = " | ".join(x for x in (_clean(_t(c(r, 17))), _clean(_t(c(r, 18)))) if x)
                 db.execute("INSERT INTO kontrol(date,kind,result,note) VALUES(?,?,?,?)",
-                    (_d(c(r, 14)), KINDS[2], _cap(_t(c(r, 16))), note))
+                    (_d(c(r, 14)), K_TUR, _cap(_t(c(r, 16))), note))
             if _d(c(r, 20)):
                 db.execute("INSERT INTO kontrol(date,kind,result,note) VALUES(?,?,?,?)",
-                    (_d(c(r, 20)), KINDS[3], _cap(_t(c(r, 22))), _t(c(r, 23))))
+                    (_d(c(r, 20)), K_EGZ, _cap(_t(c(r, 22))), _t(c(r, 23))))
             if _d(c(r, 25)):
                 litre, km = _fuel(c(r, 28)), _n(c(r, 29))
                 if litre and km:
                     res, note = f"{litre / km * 100:.1f} L/100km", f"{litre:g} L / {km:g} km (son sıfırlamadan sonra)"
                 else:
                     res, note = "", ""
-                db.execute("INSERT INTO kontrol(date,kind,result,note) VALUES(?,?,?,?)", (_d(c(r, 25)), KINDS[4], res, note))
+                db.execute("INSERT INTO kontrol(date,kind,result,note) VALUES(?,?,?,?)", (_d(c(r, 25)), K_YAK, res, note))
             if _d(c(r, 31)):
                 n = lambda col: _psi(c(r, col))
                 res = f"Sağ ön {n(33)}, sol ön {n(34)}, sağ arka {n(35)}, sol arka {n(36)}, stepne {n(37)} (psi)"
-                db.execute("INSERT INTO kontrol(date,kind,result,note) VALUES(?,?,?,?)", (_d(c(r, 31)), KINDS[5], res, ""))
+                db.execute("INSERT INTO kontrol(date,kind,result,note) VALUES(?,?,?,?)", (_d(c(r, 31)), K_LAS, res, ""))
     ws = _sheet(wb, "Periyodik")
     items = [("Motor yağı ve filtresi", 2, 10000, 12), ("Hava filtresi", 6, 10000, 12),
              ("Polen filtresi", 10, 10000, 12), ("Mazot filtresi", 14, 20000, None)]
@@ -636,6 +858,7 @@ def import_legacy(db, path, aid):
                             _d(ws.cell(r, 5).value), _t(ws.cell(r, 6).value)))
     for t in ("km", "kontrol", "bakim", "parca"):
         db.execute(f"UPDATE {t} SET arac_id=? WHERE arac_id IS NULL", (aid,))
+    migrate_data(db)
     db.commit()
 
 # ----------------------------------------------------------------- şablonlar
@@ -665,6 +888,13 @@ details{background:var(--card);border:1px solid var(--line);border-radius:10px;p
 .bar{display:flex;align-items:center;gap:8px;margin:4px 0}.bar i{display:block;height:14px;background:var(--acc);border-radius:3px;min-width:2px}
 .bar em{font-style:normal;min-width:120px}.bar u{text-decoration:none;color:var(--mut);font-size:13px}
 .cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}.chip{padding:7px 14px;border-radius:999px;border:1px solid var(--line);background:var(--card);color:var(--ink);text-decoration:none;font-size:14px}
+.chip.on{background:var(--acc);color:#fff;border-color:transparent}.chip.g-yesil{background:#1a7f3722;border-color:#1a7f37}.chip.g-yesil.on{background:#1a7f37;color:#fff}
+.chip.g-mavi{background:#1f6feb22;border-color:#1f6feb}.chip.g-mavi.on{background:#1f6feb;color:#fff}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-left:7px;background:#9aa6b4}.dot.bad{background:var(--bad)}.dot.warn{background:var(--warn)}.dot.ok{background:var(--ok)}
+.err{background:#cf222e22;border:1px solid var(--bad);padding:9px 12px;border-radius:8px;margin-bottom:10px}
+.ibox{position:relative}.ibox input{padding-right:64px}.ibox .u{position:absolute;right:10px;top:50%;transform:translateY(-50%);color:var(--mut);font-size:13px;pointer-events:none}
+input:disabled,select:disabled{opacity:.45;background:var(--th)}
 @media(max-width:700px){body{display:block}nav{width:auto}main{padding:14px}}
 """
 
@@ -677,7 +907,11 @@ BASE_T = """<!doctype html><html lang="tr"><head><meta charset="utf-8"><meta nam
 {% for k,t in tables.items() if k!='arac' %}<a href="/t/{{k}}" class="{{ 'on' if active==k }}">{{t.title}}</a>{% endfor %}
 <a href="/senkron" class="{{ 'on' if active=='senkron' }}">Senkron (GitHub)</a>
 <a href="/yedek" class="{{ 'on' if active=='yedek' }}">Yedekleme / Excel</a></nav>
-<main>{% block body %}{% endblock %}</main></body></html>"""
+<main>{% block body %}{% endblock %}</main><script>
+document.addEventListener('input',function(e){var i=e.target;if(i.dataset&&i.dataset.num){i.value=i.value.replace(i.dataset.num==='int'?/[^0-9]/g:/[^0-9.,]/g,'')}});
+function dep(root){(root||document).querySelectorAll('[data-dep]').forEach(function(el){var p=el.dataset.dep.split('=');var s=el.form.querySelector('[name="'+p[0]+'"]');var on=s&&s.value===p[1];el.disabled=!on;el.required=on;if(!on)el.value=''})}
+document.addEventListener('change',function(e){if(e.target.form)dep(e.target.form)});dep();
+</script></body></html>"""
 
 DASH_T = """{% extends 'base.html' %}{% block body %}
 <h2>Ana Ekran <span class="mut">· {{ aktif.name }}{{ " · "+aktif.plate if aktif.plate }}</span></h2>
@@ -723,6 +957,26 @@ EDIT_T = """{% extends 'base.html' %}{% block body %}
 <form method="post"><div class="grid">{% for c in t.cols %}<div><label>{{c[1]}}</label>{{ field(c, row, false) }}</div>{% endfor %}</div>
 <button>Kaydet</button> <a class="btn sec" href="{{ '/araclar' if name=='arac' else '/t/'+name }}">Vazgeç</a></form>{% endblock %}"""
 
+TAB_T = """{% extends 'base.html' %}{% block body %}
+<h2>{{ cfg.title }} <span class="mut">· {{ aktif.name }}</span></h2>
+<div class="chips">{% for t in cfg.tabs %}<a class="chip {{ t.c or '' }}{{ ' on' if t.s==tab.s }}" href="/s/{{ name }}/{{ t.s }}">{{ t.l }}{% if lv.get(t.s) %}<i class="dot {{ lv[t.s] }}"></i>{% endif %}</a>{% endfor %}</div>
+{% if hata %}<div class="err">{{ hata }}</div>{% endif %}
+{% if status %}<div class="card" style="margin-bottom:12px"><b style="display:inline;font-size:15px;color:{{ {'bad':'var(--bad)','warn':'var(--warn)','ok':'var(--ok)'}.get(status[0],'var(--mut)') }}">{{ status[1] }}</b></div>{% endif %}
+<details {{ 'open' if not rows }}><summary>+ Yeni kayıt ekle</summary><br>
+<form method="post" action="/s/{{ name }}/{{ tab.s }}/add"><div class="grid">{% for f in tab.f %}<div><label>{{ f.l }}{% if f.req or f.dep %} *{% endif %}</label>{{ tfield(f, defaults.get(f.n), true) }}</div>{% endfor %}</div><button>Kaydet</button></form></details>
+{% if name=='bakim' %}<form class="inl" style="margin-bottom:12px" method="post" action="/s/bakim/{{ tab.s }}/done" onsubmit="return confirm('Bugünün tarihi ve güncel km ile yeni kayıt eklensin mi?')"><input name="amount" placeholder="Tutar ₺ (ops.)" style="width:130px"><button class="sec">Şimdi yapıldı</button></form>{% endif %}
+<div style="overflow-x:auto"><table><tr>{% for f in tab.f %}<th class="{{ 'n' if f.t in ('pct','dec','int') }}">{{ f.l }}</th>{% endfor %}<th></th></tr>
+{% for r in rows %}<tr>{% for f in tab.f %}<td class="{{ 'n' if f.t in ('pct','dec','int') else 'w' if f.n=='note' }}">{{ tshow(f, r[f.n]) }}{% if f.n=='note' and name=='kontrol' and r['result'] and tab.s!='turbo' %} <small>({{ r['result'] }})</small>{% endif %}</td>{% endfor %}
+<td style="white-space:nowrap"><a class="btn sec" href="/s/{{ name }}/{{ tab.s }}/edit/{{ r.id }}">Düzenle</a>
+<form class="inl" method="post" action="/s/{{ name }}/{{ tab.s }}/delete/{{ r.id }}" onsubmit="return confirm('Bu kayıt silinsin mi?')"><button class="del">Sil</button></form></td></tr>
+{% else %}<tr><td colspan="20"><small>Bu sekmede kayıt yok.</small></td></tr>{% endfor %}</table></div>{% endblock %}"""
+
+TABEDIT_T = """{% extends 'base.html' %}{% block body %}
+<h2>{{ cfg.title }} · {{ tab.l }} - Düzenle</h2>
+{% if hata %}<div class="err">{{ hata }}</div>{% endif %}
+<form method="post"><div class="grid">{% for f in tab.f %}<div><label>{{ f.l }}{% if f.req or f.dep %} *{% endif %}</label>{{ tfield(f, row.get(f.n), false) }}</div>{% endfor %}</div>
+<button>Kaydet</button> <a class="btn sec" href="/s/{{ name }}/{{ tab.s }}">Vazgeç</a></form>{% endblock %}"""
+
 ARACLAR_T = """{% extends 'base.html' %}{% block body %}
 <h2>Araçlarım</h2>
 <p><small>Verileri girmek için önce soldaki listeden aracı seçin. Aracı satarsanız silmeyin, "Satıldı" yapın, geçmişi kalsın.</small></p>
@@ -738,7 +992,6 @@ ARACLAR_T = """{% extends 'base.html' %}{% block body %}
 <div><label>Plaka</label><input name="plate"></div>
 <div><label>Model yılı</label><input name="year" inputmode="numeric"></div>
 <div><label>Not</label><input name="note"></div></div>
-<label style="display:block;margin:8px 0"><input type="checkbox" name="std" value="1" checked style="width:auto"> Standart bakım kalemlerini ekle (yağ, filtreler, triger, şanzıman yağı, antifriz, fren hidroliği)</label>
 <button>Aracı ekle ve seç</button></form></details>{% endblock %}"""
 
 SENKRON_T = """{% extends 'base.html' %}{% block body %}
@@ -774,7 +1027,7 @@ YEDEK_T = """{% extends 'base.html' %}{% block body %}
 
 app = Flask(__name__)
 app.jinja_loader = DictLoader({"base.html": BASE_T, "dash.html": DASH_T, "list.html": LIST_T,
-                               "edit.html": EDIT_T, "yedek.html": YEDEK_T, "araclar.html": ARACLAR_T, "senkron.html": SENKRON_T})
+                               "edit.html": EDIT_T, "yedek.html": YEDEK_T, "araclar.html": ARACLAR_T, "senkron.html": SENKRON_T, "tab.html": TAB_T, "tabedit.html": TABEDIT_T})
 AYLAR = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
 
 def show(col, v):
@@ -805,7 +1058,7 @@ def inject():
     aktif = cur_arac(db)
     araclar = db.execute("SELECT * FROM arac WHERE status='Aktif' OR id=? ORDER BY name", (aktif["id"],)).fetchall()
     db.close()
-    return dict(aktif=aktif, araclar=araclar, scoped_tables=SCOPED, logo=LOGO, favicon=FAVICON, tables=TABLES, fint=fint, fmoney=fmoney, show=show, field=field, aylar=AYLAR)
+    return dict(tshow=tab_show, tfield=tab_field, aktif=aktif, araclar=araclar, scoped_tables=SCOPED, logo=LOGO, favicon=FAVICON, tables=TABLES, fint=fint, fmoney=fmoney, show=show, field=field, aylar=AYLAR)
 
 # ----------------------------------------------------------------- sayfalar
 @app.route("/")
@@ -827,6 +1080,8 @@ def _tbl(name):
 def lst(name):
     if name == "arac":
         return redirect("/araclar")
+    if name in TABS:
+        return redirect(f"/s/{name}")
     t = _tbl(name)
     db = get_db()
     aid = cur_arac(db)["id"]
@@ -944,6 +1199,85 @@ def arac_sil(aid):
         db.commit()
     db.close()
     return redirect("/araclar")
+
+@app.route("/s/<name>")
+def tabs_home(name):
+    cfg = TABS.get(name)
+    if not cfg:
+        abort(404)
+    return redirect(f"/s/{name}/{cfg['tabs'][0]['s']}")
+
+@app.route("/s/<name>/<slug>")
+def tab_page(name, slug):
+    cfg, tab = _tabcfg(name, slug)
+    db = get_db()
+    aid = cur_arac(db)["id"]
+    rows = db.execute(f"SELECT * FROM {name} WHERE arac_id=? AND {cfg['col']}=? ORDER BY {_TORD[name]}", (aid, tab["v"])).fetchall()
+    alerts, cur, _ = build_alerts(db, aid)
+    db.close()
+    pre = f"/s/{name}/"
+    lv = {a["link"][len(pre):]: a["level"] for a in alerts if a["link"].startswith(pre)}
+    st = next(((a["level"], a["detail"]) for a in alerts if a["link"] == pre + slug), None)
+    defaults = {}
+    if name == "bakim":
+        last = bakim_latest(rows)
+        defaults = dict(last_km=cur, interval_km=last["interval_km"] if last else tab["ik"], interval_ay=last["interval_ay"] if last else tab["ia"])
+    return render_template("tab.html", active=name, name=name, cfg=cfg, tab=tab, rows=rows, lv=lv, status=st, defaults=defaults, hata=request.args.get("hata"))
+
+@app.route("/s/<name>/<slug>/add", methods=["POST"])
+def tab_add(name, slug):
+    cfg, tab = _tabcfg(name, slug)
+    vals, err = parse_tab_form(tab, request.form)
+    if err:
+        return redirect(f"/s/{name}/{slug}?hata=" + quote("; ".join(err)))
+    db = get_db()
+    data = {**_tab_base(name, tab), **vals, "arac_id": cur_arac(db)["id"]}
+    db.execute(f"INSERT INTO {name}({','.join(data)}) VALUES({','.join('?' * len(data))})", list(data.values()))
+    db.commit(); db.close()
+    return redirect(f"/s/{name}/{slug}")
+
+@app.route("/s/<name>/<slug>/edit/<int:rid>", methods=["GET", "POST"])
+def tab_edit(name, slug, rid):
+    cfg, tab = _tabcfg(name, slug)
+    db = get_db()
+    aid = cur_arac(db)["id"]
+    row = db.execute(f"SELECT * FROM {name} WHERE id=? AND arac_id=?", (rid, aid)).fetchone()
+    if not row:
+        db.close(); abort(404)
+    if request.method == "POST":
+        vals, err = parse_tab_form(tab, request.form)
+        if err:
+            db.close()
+            return redirect(f"/s/{name}/{slug}/edit/{rid}?hata=" + quote("; ".join(err)))
+        db.execute(f"UPDATE {name} SET {','.join(k + '=?' for k in vals)} WHERE id=?", list(vals.values()) + [rid])
+        db.commit(); db.close()
+        return redirect(f"/s/{name}/{slug}")
+    db.close()
+    return render_template("tabedit.html", active=name, name=name, cfg=cfg, tab=tab, row=dict(row), hata=request.args.get("hata"))
+
+@app.route("/s/<name>/<slug>/delete/<int:rid>", methods=["POST"])
+def tab_delete(name, slug, rid):
+    _tabcfg(name, slug)
+    db = get_db()
+    db.execute(f"DELETE FROM {name} WHERE id=? AND arac_id=?", (rid, cur_arac(db)["id"]))
+    db.commit(); db.close()
+    return redirect(f"/s/{name}/{slug}")
+
+@app.route("/s/bakim/<slug>/done", methods=["POST"])
+def bakim_done_tab(slug):
+    cfg, tab = _tabcfg("bakim", slug)
+    db = get_db()
+    aid = cur_arac(db)["id"]
+    cur, _ = km_stats(db, aid)
+    last = bakim_latest(db.execute("SELECT * FROM bakim WHERE arac_id=? AND name=?", (aid, tab["v"])).fetchall())
+    today = dt.date.today().isoformat()
+    db.execute("INSERT INTO bakim(arac_id, name, grup, last_date, last_km, interval_km, interval_ay) VALUES(?,?,?,?,?,?,?)",
+               (aid, tab["v"], tab["grup"], today, cur, last["interval_km"] if last else tab["ik"], last["interval_ay"] if last else tab["ia"]))
+    amt = parse_num(request.form.get("amount", "") or "")
+    if amt:
+        db.execute("INSERT INTO harcama(arac_id,date,category,descr,amount,km) VALUES(?,?,?,?,?,?)", (aid, today, "Bakım", tab["v"], amt, cur))
+    db.commit(); db.close()
+    return redirect(f"/s/bakim/{slug}")
 
 @app.after_request
 def _dirty(resp):
