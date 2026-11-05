@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Araç Bakım Takip - tamamen çevrimdışı çalışan masaüstü programı.
 Çalıştırınca tarayıcıda açılır. Veriler yanındaki bakim_verileri.db dosyasında durur."""
-import os, re, sys, io, socket, sqlite3, threading, webbrowser, datetime as dt
+import os, re, sys, io, json, time, base64, socket, sqlite3, threading, webbrowser, urllib.request, urllib.error, datetime as dt
 from flask import Flask, request, redirect, render_template, send_file, abort
 from jinja2 import DictLoader
 import openpyxl
@@ -153,6 +153,8 @@ def migrate(db):
           UPDATE {t} SET upd={NOW_SQL} WHERE id=NEW.id; END;
         CREATE TRIGGER IF NOT EXISTS {t}_ad AFTER DELETE ON {t} BEGIN
           INSERT INTO silinen(uid, tbl, upd) VALUES(OLD.uid, '{t}', {NOW_SQL}); END;""")
+    for t in SYNC_TABLES:   # tetikleyicilerden önce eklenen satırlar (varsayılan araç, ilk bakım/evrak kalemleri) için kimlik ver
+        db.execute(f"UPDATE {t} SET uid=lower(hex(randomblob(16))), upd={NOW_SQL} WHERE uid IS NULL")
 
 def init_db():
     db = get_db()
@@ -307,6 +309,221 @@ def svg_charts(rows):
     return Markup(f'<div class="cols"><div class="card"><h3 style="margin-top:0">KM gelişimi</h3>{svg1}</div>'
                   f'<div class="card"><h3 style="margin-top:0">Günlük ortalama km (kayıtlar arası)</h3>{svg2}</div></div><p>{ozet}</p>')
 
+
+# ----------------------------------------------------------------- GitHub senkron
+GH_API = os.environ.get("ARAC_GH_API", "https://api.github.com")
+SYNC_LOCK = threading.Lock()
+SYNC_STATE = {"dirty": False, "last": 0.0}
+
+class SyncError(Exception):
+    pass
+
+class Conflict(Exception):
+    pass
+
+def get_ayar(db, k, d=""):
+    r = db.execute("SELECT value FROM ayar WHERE key=?", (k,)).fetchone()
+    return r[0] if r else d
+
+def set_ayar(db, k, v):
+    db.execute("INSERT OR REPLACE INTO ayar(key, value) VALUES(?,?)", (k, v))
+
+def sync_cfg(db):
+    return dict(repo=get_ayar(db, "sync_repo"), token=get_ayar(db, "sync_token"), path=get_ayar(db, "sync_path", "veri.json"),
+                init=get_ayar(db, "sync_init") == "1", last=get_ayar(db, "sync_last"), msg=get_ayar(db, "sync_msg"))
+
+def _cl(v):
+    return int(v) if isinstance(v, float) and v.is_integer() else v
+
+def _norm(st):
+    out = {"v": 1, "del": [dict(d) for d in (st or {}).get("del", [])]}
+    for t in SYNC_TABLES:
+        out[t] = [{k: _cl(v) for k, v in r.items() if v not in (None, "")} for r in (st or {}).get(t, [])]
+    return out
+
+def _canon(st):
+    c = {"v": 1, "del": sorted(st.get("del", []), key=lambda d: d["uid"])}
+    for t in SYNC_TABLES:
+        c[t] = sorted(st.get(t, []), key=lambda r: r["uid"])
+    return json.dumps(c, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+def merge(a, b):
+    """a = yerel, b = bulut. Aynı kayıtta son değişen kazanır, eşitlikte bulut. Silme, kayıttan yeniyse kazanır."""
+    dels = {}
+    for d in a.get("del", []) + b.get("del", []):
+        if d["uid"] not in dels or d["upd"] >= dels[d["uid"]]["upd"]:
+            dels[d["uid"]] = d
+    out = {"v": 1}
+    for t in SYNC_TABLES:
+        recs = {}
+        for r in a.get(t, []) + b.get(t, []):
+            if r["uid"] not in recs or r["upd"] >= recs[r["uid"]]["upd"]:
+                recs[r["uid"]] = r
+        out[t] = [r for u, r in recs.items() if not (u in dels and dels[u]["upd"] >= r["upd"])]
+    araclar = {r["uid"] for r in out["arac"]}
+    for t in SCOPED:
+        out[t] = [r for r in out[t] if r.get("arac_uid") in araclar]
+    out["del"] = list(dels.values())
+    return out
+
+def snapshot(db):
+    amap = {r["id"]: r["uid"] for r in db.execute("SELECT id, uid FROM arac")}
+    out = {"v": 1}
+    for t in SYNC_TABLES:
+        recs = []
+        for r in db.execute(f"SELECT * FROM {t}"):
+            d = {k: _cl(r[k]) for k in r.keys() if k not in ("id", "arac_id") and r[k] not in (None, "")}
+            if t in SCOPED:
+                if r["arac_id"] not in amap:
+                    continue
+                d["arac_uid"] = amap[r["arac_id"]]
+            recs.append(d)
+        out[t] = recs
+    out["del"] = [dict(uid=r["uid"], tbl=r["tbl"], upd=r["upd"]) for r in db.execute("SELECT uid, tbl, upd FROM silinen WHERE uid IS NOT NULL")]
+    return out
+
+def apply_state(db, tgt):
+    """Yerel veriyi hedef duruma eşitler (hedefte olmayanı siler, olmayanı ekler, farklı olanı günceller)."""
+    amap = {}
+    for t in ["arac"] + [x for x in SYNC_TABLES if x != "arac"]:
+        cols = [r[1] for r in db.execute(f"PRAGMA table_info({t})") if r[1] != "id"]
+        have = {r["uid"]: r for r in db.execute(f"SELECT * FROM {t}")}
+        want = {r["uid"]: r for r in tgt.get(t, [])}
+        for uid in set(have) - set(want):
+            db.execute(f"DELETE FROM {t} WHERE uid=?", (uid,))
+        for uid, r in want.items():
+            vals = {k: r.get(k) for k in cols if k != "arac_id"}
+            if t in SCOPED:
+                vals["arac_id"] = amap.get(r.get("arac_uid"))
+                if vals["arac_id"] is None:
+                    continue
+            if uid in have:
+                if have[uid]["upd"] != r["upd"]:
+                    ks = [k for k in vals if k != "uid"]
+                    db.execute(f"UPDATE {t} SET {','.join(k + '=?' for k in ks)} WHERE uid=?", [vals[k] for k in ks] + [uid])
+            else:
+                db.execute(f"INSERT INTO {t}({','.join(vals)}) VALUES({','.join('?' * len(vals))})", list(vals.values()))
+        if t == "arac":
+            amap = {r["uid"]: r["id"] for r in db.execute("SELECT id, uid FROM arac")}
+    db.execute("DELETE FROM silinen")
+    for d in tgt.get("del", []):
+        db.execute("INSERT INTO silinen(uid, tbl, upd) VALUES(?,?,?)", (d["uid"], d["tbl"], d["upd"]))
+
+def _gh(cfg, method, path, body=None):
+    url = path if path.startswith("http") else GH_API + path
+    req = urllib.request.Request(url, method=method, data=json.dumps(body).encode() if body is not None else None, headers={
+        "Authorization": "Bearer " + cfg["token"], "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "AracBakimTakip", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return r.status, json.loads(r.read().decode() or "null")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode() or "null")
+        except Exception:
+            return e.code, None
+    except Exception:
+        raise SyncError("İnternet ya da GitHub bağlantısı kurulamadı.")
+
+def gh_get(cfg):
+    base = f"/repos/{cfg['repo']}"
+    st, j = _gh(cfg, "GET", f"{base}/contents/{cfg['path']}")
+    if st == 200:
+        txt = j.get("content") or ""
+        if not txt and j.get("git_url"):
+            txt = _gh(cfg, "GET", j["git_url"])[1].get("content", "")
+        return json.loads(base64.b64decode(txt).decode("utf-8")), j["sha"]
+    if st == 404:
+        if _gh(cfg, "GET", base)[0] == 404:
+            raise SyncError("Depo bulunamadı ya da anahtarın bu depoya erişimi yok. Depo adını ve anahtarı kontrol edin.")
+        return None, None
+    if st == 401:
+        raise SyncError("Anahtar geçersiz ya da süresi dolmuş.")
+    if st == 403:
+        raise SyncError("Erişim reddedildi (anahtar izinleri ya da istek sınırı).")
+    raise SyncError(f"GitHub hatası: {st}")
+
+def gh_put(cfg, state, sha):
+    text = json.dumps(state, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    body = {"message": "Senkron (PC) " + dt.datetime.now().strftime("%d.%m.%Y %H:%M"), "content": base64.b64encode(text.encode("utf-8")).decode()}
+    if sha:
+        body["sha"] = sha
+    st, _ = _gh(cfg, "PUT", f"/repos/{cfg['repo']}/contents/{cfg['path']}", body)
+    if st in (200, 201):
+        return
+    if st in (409, 422):
+        raise Conflict()
+    if st == 401:
+        raise SyncError("Anahtar geçersiz.")
+    if st in (403, 404):
+        raise SyncError("Yazma izni yok: anahtarda Contents > Read and write izni olmalı.")
+    raise SyncError(f"GitHub hatası: {st}")
+
+def _msg(msg, ok=False):
+    db = get_db()
+    set_ayar(db, "sync_msg", msg)
+    if ok:
+        set_ayar(db, "sync_last", dt.datetime.now().strftime("%d.%m.%Y %H:%M"))
+    db.commit(); db.close()
+
+def sync_run(mode="merge"):
+    """mode: merge (normal) | push (bu cihaz esas, buluta yükle) | pull (buluttakini bu cihaza al)."""
+    with SYNC_LOCK:
+        db = get_db()
+        try:
+            cfg = sync_cfg(db)
+            if not cfg["token"] or not cfg["repo"]:
+                raise SyncError("Önce depo adı ve erişim anahtarını kaydedin.")
+            if mode == "merge" and not cfg["init"]:
+                raise SyncError("İlk bağlantı henüz yapılmadı.")
+            for _ in range(4):
+                remote, sha = gh_get(cfg)
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    local = snapshot(db)
+                    if mode == "pull":
+                        if remote is None:
+                            raise SyncError("Bulutta henüz veri yok. Önce esas cihazda “yükle” yapın.")
+                        target = _norm(remote)
+                    elif mode == "push" or remote is None:
+                        target = local
+                    else:
+                        target = merge(local, _norm(remote))
+                    if target is not local:
+                        apply_state(db, target)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
+                if remote is None or _canon(target) != _canon(_norm(remote)):
+                    try:
+                        gh_put(cfg, target, sha)
+                    except Conflict:
+                        continue
+                set_ayar(db, "sync_init", "1"); db.commit()
+                _msg("Senkron tamam.", ok=True)
+                return True, "Senkron tamam."
+            raise SyncError("Bulut çok sık değişti, biraz sonra tekrar deneyin.")
+        except SyncError as e:
+            _msg(str(e)); return False, str(e)
+        except Exception as e:
+            _msg("Beklenmeyen hata: " + str(e)); return False, str(e)
+        finally:
+            db.close()
+
+def _sync_loop():
+    time.sleep(3)
+    while True:
+        try:
+            db = get_db(); cfg = sync_cfg(db); db.close()
+            if cfg["token"] and cfg["repo"] and cfg["init"] and (SYNC_STATE["dirty"] or time.time() - SYNC_STATE["last"] > 180):
+                SYNC_STATE["dirty"] = False
+                sync_run("merge")
+                SYNC_STATE["last"] = time.time()
+        except Exception:
+            pass
+        time.sleep(10)
+
 # ----------------------------------------------------------------- Excel'den içe aktarma
 def _d(v):
     if isinstance(v, dt.datetime):
@@ -458,6 +675,7 @@ BASE_T = """<!doctype html><html lang="tr"><head><meta charset="utf-8"><meta nam
 <div class="vsel"><form method="post" action="/arac/sec"><select name="id" onchange="this.form.submit()" title="Araç seç">{% for a in araclar %}<option value="{{a.id}}"{{ " selected" if a.id==aktif.id }}>{{a.name}}{{ " · "+a.plate if a.plate }}{{ " (satıldı)" if a.status=="Satıldı" }}</option>{% endfor %}</select></form></div>
 <a href="/araclar" class="{{ 'on' if active=='araclar' }}">＋ Araçlarım / Araç ekle</a><hr style="border:0;border-top:1px solid #ffffff40;margin:8px 16px">
 {% for k,t in tables.items() if k!='arac' %}<a href="/t/{{k}}" class="{{ 'on' if active==k }}">{{t.title}}</a>{% endfor %}
+<a href="/senkron" class="{{ 'on' if active=='senkron' }}">Senkron (GitHub)</a>
 <a href="/yedek" class="{{ 'on' if active=='yedek' }}">Yedekleme / Excel</a></nav>
 <main>{% block body %}{% endblock %}</main></body></html>"""
 
@@ -523,6 +741,25 @@ ARACLAR_T = """{% extends 'base.html' %}{% block body %}
 <label style="display:block;margin:8px 0"><input type="checkbox" name="std" value="1" checked style="width:auto"> Standart bakım kalemlerini ekle (yağ, filtreler, triger, şanzıman yağı, antifriz, fren hidroliği)</label>
 <button>Aracı ekle ve seç</button></form></details>{% endblock %}"""
 
+SENKRON_T = """{% extends 'base.html' %}{% block body %}
+<h2>Senkron (GitHub)</h2>
+{% if c.msg %}<div class="card" style="margin-bottom:12px"><b>{{ c.msg }}</b>{% if c.last %}<br><small>Son başarılı senkron: {{ c.last }}</small>{% endif %}</div>{% endif %}
+<div class="card"><h3 style="margin-top:0">1. Bağlantı</h3>
+<form method="post" action="/senkron/kaydet"><div class="grid">
+<div><label>Depo (kullanici/depo-adi)</label><input name="repo" value="{{ c.repo }}" placeholder="örn. ahmet/arac-bakim-veri"></div>
+<div><label>Erişim anahtarı (token)</label><input name="token" type="password" placeholder="{{ 'kayıtlı - değiştirmek için yeni anahtarı yazın' if c.token else 'github_pat_...' }}"></div></div>
+<button>Kaydet</button></form></div>
+{% if c.repo and c.token %}{% if not c.init %}
+<div class="card" style="margin-top:12px"><h3 style="margin-top:0">2. İlk bağlantı: hangi cihazın verisi esas alınsın?</h3>
+<p><small>İlk seferde iki cihazdaki veriler birleştirilmez, biri esas alınır. Verisi daha eksiksiz olan cihazdan başlayın (genelde bilgisayar). Sonra diğer cihazda "buluttakini al" deyin.</small></p>
+<form class="inl" method="post" action="/senkron/yukle" onsubmit="return confirm('Buluttaki veri (varsa) bu bilgisayardakiyle DEĞİŞTİRİLECEK. Devam edilsin mi?')"><button>Bu bilgisayardaki veriyi buluta yükle</button></form>
+<form class="inl" method="post" action="/senkron/al" onsubmit="return confirm('Bu bilgisayardaki TÜM veriler silinip buluttakiyle değiştirilecek. Önce yedek aldınız mı? Devam edilsin mi?')"><button class="del">Buluttaki veriyi bu bilgisayara al (buradaki veri silinir)</button></form></div>
+{% else %}<div class="card" style="margin-top:12px"><h3 style="margin-top:0">Durum</h3>
+<p><small>Otomatik senkron açık: program açılınca, kayıt değişince (birkaç saniye içinde) ve 3 dakikada bir. Değişen veriyi görmek için sayfayı değiştirmeniz yeterli.</small></p>
+<form class="inl" method="post" action="/senkron/simdi"><button>Şimdi senkronla</button></form>
+<form class="inl" method="post" action="/senkron/kaldir" onsubmit="return confirm('Bağlantı kaldırılsın mı? Veriler bu bilgisayarda kalır.')"><button class="del">Bağlantıyı kaldır</button></form></div>{% endif %}{% endif %}
+<p><small>Güvenlik: anahtar bu bilgisayardaki veritabanı dosyasında saklanır. Veritabanı yedeğini başkasıyla paylaşırsanız anahtarı GitHub'dan iptal edin.</small></p>{% endblock %}"""
+
 YEDEK_T = """{% extends 'base.html' %}{% block body %}
 <h2>Yedekleme ve Excel</h2>
 <div class="cols"><div class="card"><h3 style="margin-top:0">Yedek al</h3>
@@ -537,7 +774,7 @@ YEDEK_T = """{% extends 'base.html' %}{% block body %}
 
 app = Flask(__name__)
 app.jinja_loader = DictLoader({"base.html": BASE_T, "dash.html": DASH_T, "list.html": LIST_T,
-                               "edit.html": EDIT_T, "yedek.html": YEDEK_T, "araclar.html": ARACLAR_T})
+                               "edit.html": EDIT_T, "yedek.html": YEDEK_T, "araclar.html": ARACLAR_T, "senkron.html": SENKRON_T})
 AYLAR = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
 
 def show(col, v):
@@ -708,6 +945,56 @@ def arac_sil(aid):
     db.close()
     return redirect("/araclar")
 
+@app.after_request
+def _dirty(resp):
+    if request.method == "POST" and not request.path.startswith("/senkron") and resp.status_code in (200, 302):
+        SYNC_STATE["dirty"] = True
+    return resp
+
+@app.route("/senkron")
+def senkron():
+    db = get_db(); c = sync_cfg(db); db.close()
+    c["token"] = bool(c["token"])
+    return render_template("senkron.html", active="senkron", c=c)
+
+@app.route("/senkron/kaydet", methods=["POST"])
+def senkron_kaydet():
+    repo = re.sub(r"^(https?://)?(www\.)?github\.com/", "", (request.form.get("repo") or "").strip()).strip("/")
+    tok = (request.form.get("token") or "").strip()
+    db = get_db()
+    if repo != get_ayar(db, "sync_repo") or tok:
+        set_ayar(db, "sync_init", "0")
+    set_ayar(db, "sync_repo", repo)
+    if tok:
+        set_ayar(db, "sync_token", tok)
+    set_ayar(db, "sync_msg", "Bilgiler kaydedildi.")
+    db.commit(); db.close()
+    return redirect("/senkron")
+
+def _sync_route(mode):
+    sync_run(mode)
+    return redirect("/senkron")
+
+@app.route("/senkron/yukle", methods=["POST"])
+def senkron_yukle():
+    return _sync_route("push")
+
+@app.route("/senkron/al", methods=["POST"])
+def senkron_al():
+    return _sync_route("pull")
+
+@app.route("/senkron/simdi", methods=["POST"])
+def senkron_simdi():
+    return _sync_route("merge")
+
+@app.route("/senkron/kaldir", methods=["POST"])
+def senkron_kaldir():
+    db = get_db()
+    for k in ("sync_token", "sync_init", "sync_last", "sync_msg"):
+        db.execute("DELETE FROM ayar WHERE key=?", (k,))
+    db.commit(); db.close()
+    return redirect("/senkron")
+
 @app.route("/yedek")
 def yedek():
     return render_template("yedek.html", active="yedek", msg=request.args.get("msg"))
@@ -773,6 +1060,7 @@ def main():
     while not _port_free(port):
         port += 1
     url = f"http://127.0.0.1:{port}"
+    threading.Thread(target=_sync_loop, daemon=True).start()
     srv = threading.Thread(target=lambda: app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False), daemon=True)
     srv.start()
     for _ in range(50):  # sunucu hazır olana kadar bekle
